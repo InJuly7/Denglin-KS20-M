@@ -1,0 +1,6 @@
+# 按后缀
+*.pth   filter=lfs diff=lfs merge=lfs -text
+*.t7   filter=lfs diff=lfs merge=lfs -text
+
+# 按目录
+./img/**   filter=lfs diff=lfs merge=lfs -text

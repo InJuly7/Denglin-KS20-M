@@ -1,4 +1,8 @@
-#include "op_gpu.h"
+#include <iostream>
+#include <cuda_runtime.h>
+#include <cuda.h>
+#include "../include/op_gpu.h"
+#include "../include/utils.h"
 
 void cuda_check(cudaError_t state, std::string file, int line) {
     if (cudaSuccess != state) {
@@ -38,14 +42,13 @@ __device__ float3 operator+=(float3& value0, const float3& value1) {
     return value0;
 }
 
-__device__ void affine_project_kernel(const AffineMat* matrix, int x, int y, float* proj_x, float* proj_y) {
+__device__ void affine_project_kernel(const utils::AffineMat* matrix, int x, int y, float* proj_x, float* proj_y) {
     *proj_x = matrix->v0 * x + matrix->v1 * y + matrix->v2;
     *proj_y = matrix->v3 * x + matrix->v4 * y + matrix->v5;
 }
 
-__global__ void affine_bilinear_kernel(unsigned char* src, const int src_w, const int src_h, float* dst, const int dst_w,
-                                            const int dst_h, const AffineMat matrix, const float3 paddingValue, const float3 alpha,
-                                            const float3 beta) {
+__global__ void affine_bilinear_kernel(unsigned char* src, const int src_w, const int src_h, float* dst, const int dst_w, const int dst_h,
+                                       const utils::AffineMat matrix, const float3 paddingValue, const float3 alpha, const float3 beta) {
     int x = blockDim.x * blockIdx.x + threadIdx.x;
     int y = blockDim.y * blockIdx.y + threadIdx.y;
     if (x >= dst_w || y >= dst_h) {
@@ -97,8 +100,8 @@ __global__ void affine_bilinear_kernel(unsigned char* src, const int src_w, cons
     output[2 * dst_w * dst_h] = sum.z * alpha.z + beta.z;
 }
 
-__global__ void conf_filter_kernel(float* src, int src_box_width, int src_box_num, float* dst, int dst_box_width, int topK,
-                                          int num_class, float conf_threshold) {
+__global__ void conf_filter_kernel(float* src, int src_box_width, int src_box_num, float* dst, int dst_box_width, int topK, int num_class,
+                                   float conf_threshold) {
     if (dst[0] >= topK) {
         return;
     }
@@ -118,7 +121,7 @@ __global__ void conf_filter_kernel(float* src, int src_box_width, int src_box_nu
             label = i;
         }
     }
-    if (confidence < conf_thresh) {
+    if (confidence < conf_threshold) {
         return;
     }
     // 原子操作记录有效框数量: dst的第一个元素用于存储有效框的数量
@@ -146,6 +149,20 @@ __global__ void conf_filter_kernel(float* src, int src_box_width, int src_box_nu
     *pout_item++ = 1;
     // 116 = 84+32； 39 = 7+32
     memcpy(pout_item, pitem + num_class, 32 * sizeof(float));
+}
+
+__device__ float box_iou(float aleft, float atop, float aright, float abottom, float bleft, float btop, float bright, float bbottom) {
+    float cleft = max(aleft, bleft);
+    float ctop = max(atop, btop);
+    float cright = min(aright, bright);
+    float cbottom = min(abottom, bbottom);
+
+    float c_area = max(cright - cleft, 0.0f) * max(cbottom - ctop, 0.0f);
+    if (c_area == 0.0f) return 0.0f;
+
+    float a_area = max(0.0f, aright - aleft) * max(0.0f, abottom - atop);
+    float b_area = max(0.0f, bright - bleft) * max(0.0f, bbottom - btop);
+    return c_area / (a_area + b_area - c_area);
 }
 
 __global__ void nms_fast_kernel(float* src, int src_box_width, int topK, float iou_threshold) {
@@ -176,7 +193,7 @@ __global__ void nms_fast_kernel(float* src, int src_box_width, int topK, float i
 
 // Resize_padding + Normalize + BGR->RGB + HWC->CHW
 void affine_bilinear(unsigned char* src, const int src_w, const int src_h, float* dst, const int dst_w, const int dst_h,
-                          const AffineMat matrix) {
+                     const utils::AffineMat matrix) {
     int block_size = 16;
     const dim3 block(block_size, block_size);
     const dim3 grid(iDivUp(dst_w, block_size), iDivUp(dst_h, block_size));
@@ -188,35 +205,19 @@ void affine_bilinear(unsigned char* src, const int src_w, const int src_h, float
 
 // 置信度过滤
 void conf_filter(float* src, int src_box_width, int src_box_num, float* dst, int dst_box_width, int topK, int num_class,
-                        float conf_thresh) {
-    std::cout << "Debug decodeDevice Start:" << std::endl;
+                 float conf_thresh) {
     int block_size = 256;
     dim3 block(block_size);
     dim3 grid(iDivUp(src_box_num, block_size));
     // 第一个标志位 记录有效框数量：
     // int dstArea = 1 + dst_box_width * topK;
-    std::cout << "	num_class: " << num_class << std::endl;
-    std::cout << "	conf_thresh: " << conf_thresh << std::endl;
-    std::cout << "	src_box_num: " << src_box_num << std::endl;
-    std::cout << "	src_box_num: " << src_box_num << std::endl;
-    std::cout << "	dst_box_width: " << dst_box_width << std::endl;
-    std::cout << "	topK: " << topK << std::endl;
-    conf_filter_device_kernel<<<grid, block>>>(src, src_box_width, src_box_num, dst, dst_box_width, topK, num_class, conf_thresh);
-    std::cout << "Debug decodeDevice Ends:" << std::endl;
+    conf_filter_kernel<<<grid, block>>>(src, src_box_width, src_box_num, dst, dst_box_width, topK, num_class, conf_thresh);
 }
 
 // 非极大值抑制
 void nms_fast(float* src, int src_box_width, int topK, float iou_thresh) {
-    std::cout << "Debug nmsDeviceV1 Start:" << std::endl;
     int block_size = 128;
     dim3 block(block_size);
     dim3 grid(iDivUp(topK, block_size));
-    std::cout << "	param.topK: " << param.topK << std::endl;
-    std::cout << "	param.batch_size: " << param.batch_size << std::endl;
-    std::cout << "	param.iou_thresh: " << param.iou_thresh << std::endl;
-    std::cout << "	srcWidth: " << srcWidth << std::endl;
-    std::cout << "	srcHeight: " << srcHeight << std::endl;
-    std::cout << "	srcArea: " << srcArea << std::endl;
     nms_fast_kernel<<<grid, block>>>(src, src_box_width, topK, iou_thresh);
-    std::cout << "Debug nmsDeviceV1 Ends:" << std::endl;
 }

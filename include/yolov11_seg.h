@@ -1,267 +1,279 @@
 #pragma once
-#include "include/utils.h"
-#include "include/op_gpu.h"
-#include "include/op_cpu.h"
+
+#include <algorithm>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <opencv2/opencv.hpp>
+#include <opencv2/videoio.hpp>
+#include <opencv2/core/eigen.hpp>
+#include <Eigen/Dense>
+#include <Eigen/Core>
+#include <dlnne/dlnne.h>
+
+#include "op_gpu.h"
+#include "utils.h"
+#include "cv.h"
 
 class YOLOV11_SEG {
    public:
-    YOLOV11_SEG(const YoloParameter& param) { m_param = param; }
+    YOLOV11_SEG() = default;
     ~YOLOV11_SEG() {}
 
-    bool init(std::vector<unsigned char>& slz, const int& length) {
-        if (slz.empty()) {
-            return false;
-        }
-        this->m_engine = dl::nne::Deserialize((char*)&slz[0], length);
-        if (this->m_engine == nullptr) {
-            return false;
-        }
-        if (m_param.is_debug) std::cout << "Model Deserialize finished" << std::endl;
+    void init(const std::string inifile, const int _src_h, const int _src_w, const int _src_channel) {
+        auto kv = utils::loadIni(inifile);
+        model_name = utils::getStr(kv, "model_name", "yolov11s_seg");
+        save_path = utils::getStr(kv, "save_path", "/home/linaro/program/yolov11_seg_deepsort/result.jpg");
+        is_debug = utils::getBool(kv, "is_debug", true);
+        is_save = utils::getBool(kv, "is_save", false);
+        is_show = utils::getBool(kv, "is_show", false);
+        delaytime = utils::getInt(kv, "delaytime", 15);
+        num_class = utils::getInt(kv, "num_class", 80);
+        class_names = utils::dataSets::coco80;
+        colors = cv_utils::Colors::color80;
 
-        this->m_context = this->m_engine->CreateExecutionContext();
-        if (this->m_context == nullptr) {
-            return false;
-        }
-        if (m_param.is_debug) std::cout << "Model CreateExecutionContext finished" << std::endl;
+        // Proprecess:
+        src_h = _src_h;
+        src_w = _src_w;
+        src_channel = _src_channel;
+        batch_size = utils::getInt(kv, "batch_size", 1);
+        dst_channel = utils::getInt(kv, "dst_channel", 3);
+        dst_h = utils::getInt(kv, "dst_h", 640);
+        dst_w = utils::getInt(kv, "dst_w", 640);
+        input_num = utils::getInt(kv, "input_num", 1);
+        // Postprocess:
+        boxes_num = utils::getInt(kv, "boxes_num", 8400);
+        boxes_width = utils::getInt(kv, "boxes_width", 116);
+        dst_boxes_width = utils::getInt(kv, "dst_boxes_width", 39);
+        mask_channel = utils::getInt(kv, "mask_channel", 32);
+        mask_h = utils::getInt(kv, "mask_h", 160);
+        mask_w = utils::getInt(kv, "mask_w", 160);
+        output_num = utils::getInt(kv, "output_num", 2);
+        conf_thresh = utils::getFloat(kv, "conf_thresh", 0.50f);
+        iou_thresh = utils::getFloat(kv, "iou_thresh", 0.50f);
+        topK = utils::getInt(kv, "topK", 300);
+        // inference
+        dlrt::dlrtInit(model_name, dlrt_param, input_num, output_num, is_debug);
+
         // 创建仿射矩阵
-        Affine_Matrix();
-        return true;
+        utils::Affine_Matrix(src_w, src_h, dst_w, dst_h, src2dst, dst2src);
     }
 
-    void check() {
-        std::cout << "the engine's info:" << std::endl;
-        int nb_bindings = m_engine->GetNbBindings();
-        for (int i = 0; i < nb_bindings; ++i) {
-            auto shape = m_engine->GetBindingDimensions(i);
-            auto name = m_engine->GetBindingName(i);
-            auto data_type = m_engine->GetBindingDataType(i);
-            std::cout << name << "  " << data_type << std::endl;
-            for (int j = 0; j < shape.nbDims; ++j) {
-                std::cout << shape.d[j] << "  ";
-            }
-            std::cout << std::endl;
-        }
-
-        m_input_dims = this->m_context->GetBindingDimensions(0);
-        assert(m_param.batch_size = m_input_dims.d[0]);
-        assert(m_param.channel == m_input_dims.d[1]);
-        assert(m_param.dst_h == m_input_dims.d[2]);
-        assert(m_param.dst_w == m_input_dims.d[3]);
-
-        m_output_dims = this->m_context->GetBindingDimensions(1);
-        assert(m_param.boxes_num == m_output_dims.d[1]);
-        assert(m_param.boxes_width == m_output_dims.d[2]);
-    }
-
-    void Alloc_buffer() {
+    void preprocess(const cv::Mat& img) {
         // Image To Device
-        m_input_src_device = nullptr;
-        CHECK(cudaMalloc(&m_input_src_device, m_param.channel * m_param.src_h * m_param.src_w * sizeof(unsigned char)));
-
-        // Pre-process result to Device
-        m_input_dst_device = nullptr;
-        CHECK(cudaMalloc(&m_input_dst_device, m_param.channel * m_param.dst_h * m_param.dst_w * sizeof(float)));
-
-        // Inference result to Device
-        m_output0_src_device = nullptr;
-        m_output1_src_device = nullptr;
-        m_output0_conf_device = nullptr;
-        CHECK(cudaMalloc(&m_output0_src_device, m_param.boxes_num * m_param.boxes_width * sizeof(float))); // 8400*84
-        CHECK(cudaMalloc(&m_output1_src_device, m_param.mask_grid_h * m_param.mask_grid_w * m_param.mask_channel * sizeof(float))); // 25600x32
-        CHECK(cudaMalloc(&m_output0_conf_device, m_param.topK * m_param.dst_boxes_width * sizeof(float))); // topK*39
-
-        // Inference result to Host
-        m_output0_conf_host = (float*)malloc(m_param.topK * m_param.dst_boxes_width * sizeof(float));
-        m_output1_src_host = (float*)malloc(m_param.mask_grid_h * m_param.mask_grid_w * m_param.mask_channel * sizeof(float));
-        m_objects.reserve(m_param.topK);
-        m_detections.reserve(m_param.topK);
-    }
-
-    void Free_buffer() {
+        input_src_device = nullptr;
+        CHECK(cudaMalloc(&input_src_device, src_channel * src_h * src_w * sizeof(unsigned char)));
+        CHECK(cudaMemcpy(input_src_device, img.data, sizeof(unsigned char) * src_channel * src_h * src_w, cudaMemcpyHostToDevice));
+        // Pre-process
+        // input_0
+        // input_src_device: [1,src_h,src_w,3] -> dlrt_param.input_buffers[0]: [1,3,dst_h,dst_w]
+        affine_bilinear(input_src_device, src_w, src_h, dlrt_param.input_buffers[0].device_ptr, dst_w, dst_h, dst2src);
+        if (is_debug) std::cout << "Preprocess done." << std::endl;
         // Image To Device
-        CHECK(cudaFree(m_input_src_device));
-
-        // Pre-process result to Device
-        CHECK(cudaFree(m_input_dst_device));
-
-        // Inference result to Device
-        CHECK(cudaFree(m_output0_src_device));
-        CHECK(cudaFree(m_output1_src_device));
-
-        // Post process result to Device
-        CHECK(cudaFree(m_output0_conf_device));
-        // Post process result to Host
-        free(m_output0_conf_host);
-        free(m_output1_src_host);
-    }
-
-    // 计算仿射变换的逆变换
-    void invertAffineTransform(const float src2dst[2][3], float dst2src[2][3]) {
-        // 提取 2x2 旋转/缩放矩阵
-        float a = src2dst[0][0];
-        float b = src2dst[0][1];
-        float c = src2dst[1][0];
-        float d = src2dst[1][1];
-
-        // 提取平移向量
-        float tx = src2dst[0][2];
-        float ty = src2dst[1][2];
-
-        // 计算行列式
-        float det = a * d - b * c;
-
-        // 计算逆变换矩阵
-        dst2src[0][0] = d / det;
-        dst2src[0][1] = -b / det;
-        dst2src[0][2] = -(d * tx - b * ty) / det;
-        dst2src[1][0] = -c / det;
-        dst2src[1][1] = a / det;
-        dst2src[1][2] = -(-c * tx + a * ty) / det;
-    }
-
-    void Affine_Matrix() {
-        // 读入图像后，计算仿射矩阵
-        float a = float(m_param.dst_h) / m_param.src_h;
-        float b = float(m_param.dst_w) / m_param.src_w;
-        float scale = a < b ? a : b;
-
-        // cv::Mat src2dst = (cv::Mat_<float>(2, 3) << scale, 0.f, (-scale * m_param.src_w + m_param.dst_w + scale - 1) * 0.5, 0.f, scale,
-        //                    (-scale * m_param.src_h + m_param.dst_h + scale - 1) * 0.5);
-        // cv::Mat dst2src = cv::Mat::zeros(2, 3, CV_32FC1);
-        // cv::invertAffineTransform(src2dst, dst2src);
-
-        // 创建 src2dst 变换矩阵
-        float src2dst[2][3] = {{scale, 0.f, (-scale * m_param.src_w + m_param.dst_w + scale - 1) * 0.5f},
-                               {0.f, scale, (-scale * m_param.src_h + m_param.dst_h + scale - 1) * 0.5f}};
-
-        // 计算逆变换
-        float dst2src[2][3];
-        invertAffineTransform(src2dst, dst2src);
-
-        // 赋值给成员变量
-        m_dst2src.v0 = dst2src[0][0];
-        m_dst2src.v1 = dst2src[0][1];
-        m_dst2src.v2 = dst2src[0][2];
-        m_dst2src.v3 = dst2src[1][0];
-        m_dst2src.v4 = dst2src[1][1];
-        m_dst2src.v5 = dst2src[1][2];
-
-        std::cout << "v0: " << m_dst2src.v0 << " v1: " << m_dst2src.v1 << " v2: " << m_dst2src.v2 << std::endl;
-        std::cout << "v3: " << m_dst2src.v3 << " v4: " << m_dst2src.v4 << " v5: " << m_dst2src.v5 << std::endl;
-    }
-
-    void copy(const cv::Mat& img) {
-        CHECK(cudaMemcpy(m_input_src_device, img.data, sizeof(unsigned char) * m_param.channel * m_param.src_h * m_param.src_w,
-                         cudaMemcpyHostToDevice));
-        // DumpGPUMemoryToFile(m_input_src_device, sizeof(unsigned char) * 3 * m_param.src_h * m_param.src_w, "640640_GPU.bin");
-    }
-
-    void preprocess() {
-        affine_bilinear(m_input_src_device, m_param.src_w, m_param.src_h, m_input_dst_device, m_param.dst_w, m_param.dst_h, m_dst2src);
+        CHECK(cudaFree(input_src_device));
         // DumpGPUMemoryToFile(m_input_dst_device, 3 * m_param.src_h * m_param.src_w * sizeof(float), "m_input_dst_device.bin");
     }
 
     bool infer() {
-        float* bindings[] = {m_input_dst_device, m_output0_conf_device, m_output1_src_device};
-        bool context = m_context->Execute(1, (void**)bindings);
+        bool success = dlrt::infer(dlrt_param);
+        assert(success == true);
+        if (is_debug) std::cout << "Inference done." << std::endl;
+        return success;
         // DumpGPUMemoryToFile(m_output_src_device, m_output_area * sizeof(float), "inference_output.bin");
-        return context;
     }
-
 
     void postprocess(cv::Mat& img) {
-        DeviceTimer t0;
-        cudaMemcpy(m_output0_conf_host, m_output0_conf_device, m_param.topK * m_param.dst_boxes_width * sizeof(float),
-                   cudaMemcpyDeviceToHost);
-        cudaMemcpy(m_output1_src_host, m_output1_src_device,
-                   m_param.mask_grid_h * m_param.mask_grid_w * m_param.mask_channel * sizeof(float), cudaMemcpyDeviceToHost);
-        if (m_param.is_debug) std::cout << "Cuda Memcpy Device to Host Time: " << t0.getUsedTime() << " ms" << std::endl;
+        // Post-process
+        // output_0
+        // dlrt_param.output_buffers[0]: [1,mask_channel,mask_h,mask_w]
+        // output_1
+        // dlrt_param.output_buffers[1]: [1,boxes_num,boxes_width] -> output_1_conf_device: [1,1+topK,dst_boxes_width]
+        utils::DeviceTimer t0;
+        output1_conf_device = nullptr;
+        CHECK(cudaMalloc(&output1_conf_device, (1 + topK * dst_boxes_width) * sizeof(float)));
+
+        // Inference result to Host
+        output0_src_host = (float*)malloc(mask_channel * mask_h * mask_w * sizeof(float));
+        output1_conf_host = (float*)malloc((1 + topK * dst_boxes_width) * sizeof(float));
+
+
+        conf_filter(dlrt_param.output_buffers[1].device_ptr, boxes_width, boxes_num, output1_conf_device, dst_boxes_width, topK, num_class,
+                    conf_thresh);
+        nms_fast(output1_conf_device, dst_boxes_width, topK, iou_thresh);
+
         
+        cudaMemcpy(output1_conf_host, output1_conf_device, (1 + topK * dst_boxes_width) * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(output0_src_host, dlrt_param.output_buffers[0].device_ptr, mask_channel * mask_h * mask_w * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        if (is_debug) std::cout << "Post process GPU: " << t0.getUsedTime() << " ms" << std::endl;
+
+        int num_boxes = std::min((int)(output1_conf_host)[0], topK);  // conf filter 后的目标数量
         int current_boxes = 0;
-        // 通过阈值过滤检测框
-        for (int i = 0; i < m_param.boxes_num; ++i) {
-            const float* box_tensor = &m_output0_conf_host[i * m_param.boxes_width];
-            float max_score = 0;
-            int label = -1;
-            for (int j = 4; j < 4 + m_param.num_class; ++j) {
-                if (box_tensor[j] > max_score) {
-                    max_score = box_tensor[j];
-                    label = j - 4;
-                }
-            }
-            if (max_score < m_param.conf_thresh) continue;
-            float angle = box_tensor[19];
+        if (is_debug) std::cout << "Bounding Box Num: " << num_boxes << std::endl;
 
-            if (current_boxes < m_param.topK) {
-                // cx, cy, w, h, angle, confidence, label
-                m_detections.push_back(Box(box_tensor[0], box_tensor[1], box_tensor[2], box_tensor[3], angle, max_score, label));
+        cv::Mat mask160 = cv::Mat::zeros(1, mask_h * mask_w, CV_32F);
+        cv::Mat img_canvas = cv::Mat::zeros(cv::Size(src_w, src_h), CV_8UC3);
+        img_canvas.setTo(cv::Scalar(0, 0, 0));
+        cv::Rect thresh_roi_160 = cv::Rect(0, 0, mask_h, mask_w);
+        cv::Rect thresh_roi_src = cv::Rect(0, 0, src_w, src_h);
+
+        Eigen::MatrixXf mask_eigen160 = Eigen::MatrixXf(1, mask_h * mask_w);
+        float downsample_scale = static_cast<float>(mask_h) / static_cast<float>(dst_h);
+
+        // [160*160,32]
+        Eigen::Map<Eigen::MatrixXf> img_seg_(output0_src_host, mask_h * mask_w, mask_channel);
+        std::vector<utils::mask_canvas> masks;
+        std::vector<utils::Box> boxes;
+        std::vector<utils::label_info> labels;
+
+        for (int box_idx = 0; box_idx < num_boxes; box_idx++) {
+            // left top right bottom ,conf,label,flag,segmentation[32]
+            float* ptr = output1_conf_host + 1 + box_idx * dst_boxes_width;
+            if (ptr[6]) {
+
+                int label = ptr[5];
+                float conf = ptr[4];
+                cv::Scalar color = colors[label];
+                std::string class_name = class_names[label];
+                if(is_debug) std::cout << "	label: " << label << " conf " << conf << std::endl;
+
+                // [32,1] 分割编码系数
+                Eigen::Map<Eigen::MatrixXf> img_obj_seg_(ptr + 7, mask_channel, 1);
+                // [160*160,1] 计算物体的分割掩码, 掩码概率矩阵
+                mask_eigen160 = img_seg_ * img_obj_seg_;
+                cv::eigen2cv(mask_eigen160, mask160);
+
+                // sigmoid 函数: 1/(1+e^(-x)) 表示掩码概率
+                cv::exp(-mask160, mask160);
+                mask160 = 1.f / (1.f + mask160);
+                // [25600,1] --> [160,160]
+                // cv::Mat.reshape 将 m_mask160 重塑为 160 行, 自动计算列数，1：通道数
+                mask160 = mask160.reshape(1, mask_h);
+                if (is_debug) std::cout << "	m_mask160.shape: " << mask160.rows << " " << mask160.cols << std::endl;
+                // std::cout << "	left: " << ptr[0] << "; top: " << ptr[1] << "; right: " << ptr[2] << "; bottom: " << ptr[3] <<
+                // std::endl; 计算检测框在掩码尺度上的坐标 从[640,640]的坐标 映射到 [160,160]的坐标 ptr[0:3] left top right bottom
+                int x_lt_160 = std::round(ptr[0] * downsample_scale);
+                int y_lt_160 = std::round(ptr[1] * downsample_scale);
+                int x_rb_160 = std::round(ptr[2] * downsample_scale);
+                int y_rb_160 = std::round(ptr[3] * downsample_scale);
+                // std::cout << "	x_lt_160: " << x_lt_160 << "; y_lt_160: " << y_lt_160 << "; x_rb_160: " << x_rb_160
+                //           << "; y_rb_160: " << y_rb_160 << std::endl;
+
+                // 创建掩码尺度上的感兴趣区域（ROI）
+                // 使用 & 运算符计算掩码尺度矩形与 thresh_roi_160 的交集, 保证后续掩码操作不会越界
+                cv::Rect roi160 = cv::Rect(x_lt_160, y_lt_160, x_rb_160 - x_lt_160, y_rb_160 - y_lt_160) & thresh_roi_160;
+                // std::cout << "	roi160.shape: " << roi160.height << " " << roi160.width << std::endl;
+                if (roi160.width == 0 || roi160.height == 0) continue;
+
+                // 计算检测框在原始图像尺度上的坐标
+                int x_lt_src = std::round(dst2src.v0 * ptr[0] + dst2src.v1 * ptr[1] + dst2src.v2);
+                int y_lt_src = std::round(dst2src.v3 * ptr[0] + dst2src.v4 * ptr[1] + dst2src.v5);
+                int x_rb_src = std::round(dst2src.v0 * ptr[2] + dst2src.v1 * ptr[3] + dst2src.v2);
+                int y_rb_src = std::round(dst2src.v3 * ptr[2] + dst2src.v4 * ptr[3] + dst2src.v5);
+                if (is_debug)
+                    std::cout << "	x_lt_src: " << x_lt_src << "; y_lt_src: " << y_lt_src << "; x_rb_src: " << x_rb_src
+                              << "; y_rb_src: " << y_rb_src << std::endl;
+
+                // 保证后续操作不会超出原图像尺寸范围
+                cv::Rect roisrc = cv::Rect(x_lt_src, y_lt_src, x_rb_src - x_lt_src, y_rb_src - y_lt_src) & thresh_roi_src;
+                // std::cout << "	roisrc.shape: " << roisrc.height << " " << roisrc.width << std::endl;
+                if (roisrc.width == 0 || roisrc.height == 0) continue;
+
+                // for opencv >=4.7(faster)
+                // cv::Mat mask_instance;
+                // cv::resize(cv::Mat(m_mask160, roi160), mask_instance, cv::Size(roisrc.width, roisrc.height), cv::INTER_LINEAR);
+                // mask_instance = mask_instance > 0.5f;
+                // cv::cvtColor(mask_instance, mask_instance, cv::COLOR_GRAY2BGR);
+                // mask_instance.setTo(color, mask_instance);
+                // cv::addWeighted(mask_instance, 0.45, m_img_canvas(roisrc), 1.0, 0., m_img_canvas(roisrc));
+
+                // for opencv >=3.2.0
+                cv::Mat mask_instance;
+                // 从 掩码概率矩阵 mask160 中提取 roi160 定义的区域
+                // 使用插值方法 i调整大小到 (roisrc.width, roisrc.height) 尺寸
+                cv::resize(cv::Mat(mask160, roi160), mask_instance, cv::Size(roisrc.width, roisrc.height), cv::INTER_LINEAR);
+                // 将掩码二值化 - 大于 0.5 的值设为 1（物体），小于等于 0.5 的值设为 0（背景）
+                mask_instance = mask_instance > 0.5f;
+
+                cv::Mat mask_instance_bgr;
+                // 将单通道掩码转换为 3 通道 BGR 格式，以便应用颜色
+                cv::cvtColor(mask_instance, mask_instance_bgr, cv::COLOR_GRAY2BGR);
+                // 将掩码中的物体区域（值为1的区域）设置为当前类别的颜色
+                mask_instance_bgr.setTo(color, mask_instance);
+                cv::String det_info = class_names[label] + " " + cv::format("%.4f", ptr[4]);
+
+                utils::Box box = utils::Box(x_lt_src, y_lt_src, x_rb_src, y_rb_src, conf, label, color);
+                utils::label_info label_info = utils::label_info(label, conf, cv::Point(x_lt_src, y_lt_src), det_info, color);
+                utils::mask_canvas mask = utils::mask_canvas(mask_instance_bgr, img_canvas, roisrc, 0.45f);
+
+                boxes.push_back(box);
+                labels.push_back(label_info);
+                masks.push_back(mask);
                 current_boxes++;
-            } else
-                break;
-        }
-        if (m_param.is_debug) std::cout << "Detections Box Num: " << current_boxes << std::endl;
-
-        // 小于号重载
-        std::sort(m_detections.begin(), m_detections.end());
-
-        // NMS 过滤
-        int object_boxes = 0;
-        for (int i = 0; i < current_boxes; i++) {
-            if (m_detections[i].flag == false) continue;
-            xywh2xyxyxyxy(m_detections[i].cx, m_detections[i].cy, m_detections[i].w, m_detections[i].h, m_detections[i].angle,
-                                 m_detections[i].points, m_dst2src);
-            m_objects.push_back(m_detections[i]);
-            object_boxes++;
-
-            for (size_t j = i + 1; j < current_boxes; ++j) {
-                if (m_detections[j].flag == false) continue;
-                if (m_detections[i].label != m_detections[j].label) continue;
-                float iou = probiou(m_detections[i], m_detections[j]);
-                if (iou > m_param.iou_thresh) {
-                    m_detections[j].flag = false;  // IoU大于阈值的框被标记为移除
-                }
             }
         }
-        if (m_param.is_debug) std::cout << "Bounding Box Num: " << object_boxes << std::endl;
+        
+        if (is_show) cv_utils::draw(img, boxes, masks, labels, true, true, true, is_show);
+        if (is_save) cv_utils::draw(img, boxes, masks, labels, false, true, false, is_show, is_save, windows_title, save_path);  
 
-        if (m_param.is_show) show_obb(m_objects, m_param.class_names, img, m_param.delaytime);
-        if (m_param.is_save) save_obb(m_objects, m_param.class_names, m_param.save_path, img);
-    }
+        // Post process result to Device
+        CHECK(cudaFree(output1_conf_device));
 
-    void reset() {
-        std::fill(m_objects.begin(), m_objects.end(), Box());
-        std::fill(m_detections.begin(), m_detections.end(), Box());
-    }
-
-    void getGPUutils(float& gpu_utils) {
-        // 创建随机数生成器
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_real_distribution<float> dis(-3.0f, 3.0f);
-        gpu_utils = dis(gen) + 85.0f;
+        // Post process result to Host
+        free(output0_src_host);
+        free(output1_conf_host);
+        if (is_debug) std::cout << "Post process done. Final Box Num: " << current_boxes << std::endl;
     }
 
    public:
-    dl::nne::Engine* m_engine;
-    dl::nne::ExecutionContext* m_context;
-    dl::nne::Dims m_input_dims;
-    dl::nne::Dims m_output_dims;
+    std::string model_name = "";
+    std::string save_path = "";
+    bool is_show = false;
+    bool is_save = false;
+    bool is_debug = false;
+    int delaytime = 15;  // 15ms
+    int num_class = 0;
+    std::vector<std::string> class_names;
+    std::vector<cv::Scalar> colors;
 
-    YoloParameter m_param;
-    std::vector<Box> m_objects;
-    std::vector<Box> m_detections;
-    AffineMat m_dst2src;
+    int src_h = 0;
+    int src_w = 0;
+    int src_channel = 3;
+
+    int batch_size = 1;
+    int dst_channel = 3;
+    int dst_h = 0;
+    int dst_w = 0;
+    int input_num = 0;
+
+    int boxes_num = 0;
+    int boxes_width = 0;
+    int dst_boxes_width = 0;
+    int mask_channel = 0;
+    int mask_h = 0;
+    int mask_w = 0;
+    int output_num = 0;
+    float iou_thresh = 0.0f;
+    float conf_thresh = 0.0f;
+    int topK = 0;
+
+    const std::string windows_title = "Denglin-KS20-M";
+    int char_width = 11;
+    double font_scale = 0.6;
+    int det_info_render_width = 15;
+
+    // inference engine
+    dlrt::dlrtParam dlrt_param;
+
+    utils::AffineMat dst2src;
+    utils::AffineMat src2dst;
 
     // input
-    unsigned char* m_input_src_device;
-    float* m_input_dst_device;
+    unsigned char* input_src_device;
 
     // output
-    float* m_output0_src_device;
-    float* m_output0_conf_device;
-    float* m_output1_src_device;
+    float* output1_conf_device;
 
-    float* m_output0_conf_host;
-    float* m_output1_src_host;
-    
+    float* output1_conf_host;
+    float* output0_src_host;
 };
