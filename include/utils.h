@@ -94,7 +94,7 @@ struct Point {
     float x, y;
     bool flag;
     Point() = default;
-    Point(float x, float y) : x(x), y(y) {}
+    Point(float x, float y, bool flag) : x(x), y(y), flag(flag) {}
 };
 
 enum class InputStream { IMAGE, VIDEO, CAMERA };

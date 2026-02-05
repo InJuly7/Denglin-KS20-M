@@ -151,6 +151,52 @@ __global__ void conf_filter_kernel(float* src, int src_box_width, int src_box_nu
     memcpy(pout_item, pitem + num_class, 32 * sizeof(float));
 }
 
+__global__ void conf_filter_nomask_kernel(float* src, int src_box_width, int src_box_num, float* dst, int dst_box_width, int topK,
+                                          int num_class, float conf_threshold) {
+    if (dst[0] >= topK) {
+        return;
+    }
+    int box_idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (box_idx >= src_box_num) {
+        return;
+    }
+    float* pitem = src + box_idx * src_box_width;
+    float* class_confidence = pitem + 4;
+    float confidence = *class_confidence++;
+    int label = 0;
+    for (int i = 1; i < num_class; ++i, ++class_confidence) {
+        if (*class_confidence > confidence) {
+            confidence = *class_confidence;
+            label = i;
+        }
+    }
+    if (confidence < conf_threshold) {
+        return;
+    }
+    int index = atomicAdd(dst, 1);
+    if (index >= topK) {
+        return;
+    }
+
+    float cx = *pitem++;
+    float cy = *pitem++;
+    float width = *pitem++;
+    float height = *pitem++;
+
+    float left = cx - width * 0.5f;
+    float top = cy - height * 0.5f;
+    float right = cx + width * 0.5f;
+    float bottom = cy + height * 0.5f;
+    float* pout_item = dst + 1 + index * dst_box_width;
+    *pout_item++ = left;
+    *pout_item++ = top;
+    *pout_item++ = right;
+    *pout_item++ = bottom;
+    *pout_item++ = confidence;
+    *pout_item++ = label;
+    *pout_item++ = 1;
+}
+
 __device__ float box_iou(float aleft, float atop, float aright, float abottom, float bleft, float btop, float bright, float bbottom) {
     float cleft = max(aleft, bleft);
     float ctop = max(atop, btop);
@@ -203,6 +249,18 @@ void affine_bilinear(unsigned char* src, const int src_w, const int src_h, float
     affine_bilinear_kernel<<<grid, block>>>(src, src_w, src_h, dst, dst_w, dst_h, matrix, paddingValue, alpha, beta);
 }
 
+// Resize_padding (pad=0) + Normalize 0-1 + BGR->RGB + HWC->CHW
+void affine_bilinear_pad0(unsigned char* src, const int src_w, const int src_h, float* dst, const int dst_w, const int dst_h,
+                          const utils::AffineMat matrix) {
+    int block_size = 16;
+    const dim3 block(block_size, block_size);
+    const dim3 grid(iDivUp(dst_w, block_size), iDivUp(dst_h, block_size));
+    const float3 paddingValue = make_float3(0.0f, 0.0f, 0.0f);
+    const float3 alpha = make_float3(1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f);
+    const float3 beta = make_float3(0.0f, 0.0f, 0.0f);
+    affine_bilinear_kernel<<<grid, block>>>(src, src_w, src_h, dst, dst_w, dst_h, matrix, paddingValue, alpha, beta);
+}
+
 // 置信度过滤
 void conf_filter(float* src, int src_box_width, int src_box_num, float* dst, int dst_box_width, int topK, int num_class,
                  float conf_thresh) {
@@ -212,6 +270,15 @@ void conf_filter(float* src, int src_box_width, int src_box_num, float* dst, int
     // 第一个标志位 记录有效框数量：
     // int dstArea = 1 + dst_box_width * topK;
     conf_filter_kernel<<<grid, block>>>(src, src_box_width, src_box_num, dst, dst_box_width, topK, num_class, conf_thresh);
+}
+
+// 置信度过滤（无掩码）
+void conf_filter_nomask(float* src, int src_box_width, int src_box_num, float* dst, int dst_box_width, int topK, int num_class,
+                        float conf_thresh) {
+    int block_size = 256;
+    dim3 block(block_size);
+    dim3 grid(iDivUp(src_box_num, block_size));
+    conf_filter_nomask_kernel<<<grid, block>>>(src, src_box_width, src_box_num, dst, dst_box_width, topK, num_class, conf_thresh);
 }
 
 // 非极大值抑制

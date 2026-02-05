@@ -5,6 +5,7 @@
 #include <array>
 #include <cassert>
 #include <memory>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <opencv2/opencv.hpp>
@@ -13,492 +14,364 @@
 #include <eigen3/Eigen/Dense>
 #include <dlnne/dlnne.h>
 
-#include "include/op_gpu.h"
+#include "op_gpu.h"
 #include "utils.h"
 #include "cv.h"
-#include <onnxruntime_cxx_api.h>
-#include <onnxruntime_c_api.h>
+#include "ort.h"
 
 class SAM2 {
    public:
     SAM2() = default;
     ~SAM2() {}
+
+    static float clampf(float v, float lo, float hi) {
+        return std::max(lo, std::min(v, hi));
+    }
     
-    /*
-        1. dlnne初始化, 反序列化引擎文件, 创建执行上下文
-        2. onnxruntime 初始化, 创建session, 准备输入输出name
-        3. 加载ini文件
-    */
     void init(const std::string inifile, const int _src_h, const int _src_w, const int _src_channel) {
+        auto kv = utils::loadIni(inifile);
+        encoder_model_name = utils::getStr(kv, "encoder_model_name", "image_encoder_s");
+        decoder_model_name = utils::getStr(kv, "decoder_model_name", "image_decoder_s");
+        std::string model_dir = utils::getStr(kv, "model_dir", "/data/model/sam2/");
+        save_path = utils::getStr(kv, "save_path", "/home/linaro/program/yolov11_seg_deepsort/sam2_result.jpg");
+        is_debug = utils::getBool(kv, "is_debug", true);
+        is_save = utils::getBool(kv, "is_save", false);
+        is_show = utils::getBool(kv, "is_show", false);
+        encoder_is_dynamic = utils::getBool(kv, "encoder_is_dynamic", true);
+        decoder_is_dynamic = utils::getBool(kv, "decoder_is_dynamic", false);
+        delaytime = utils::getInt(kv, "delaytime", 15);
+
+        // Encoder Proprecess:
+        src_h = _src_h;
+        src_w = _src_w;
+        src_channel = _src_channel;
+        batch_size = utils::getInt(kv, "batch_size", 1);
+        dst_channel = utils::getInt(kv, "dst_channel", 3);
+        dst_h = utils::getInt(kv, "dst_h", 640);
+        dst_w = utils::getInt(kv, "dst_w", 640);
+        encoder_input_num = utils::getInt(kv, "encoder_input_num", 1);
+        encoder_output_num = utils::getInt(kv, "encoder_output_num", 2);
+
+        // Encoder Postprocess:
+        feat0_c = utils::getInt(kv, "feat0_c", 32);
+        feat0_h = utils::getInt(kv, "feat0_h", 256);
+        feat0_w = utils::getInt(kv, "feat0_w", 256);
+        feat1_c = utils::getInt(kv, "feat1_c", 64);
+        feat1_h = utils::getInt(kv, "feat1_h", 128);
+        feat1_w = utils::getInt(kv, "feat1_w", 128);
+        embed_c = utils::getInt(kv, "embed_c", 256);
+        embed_h = utils::getInt(kv, "embed_h", 64);
+        embed_w = utils::getInt(kv, "embed_w", 64);
         
 
-        // ONNX Runtime 初始化
-        session_options.SetGraphOptimizationLevel(ORT_ENABLE_EXTENDED);
-        session = std::make_unique<Ort::Session>(env, m_param.decoder_path.c_str(), session_options);
-        memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        // Encoder inference
+        dlrt::dlrtInit(encoder_model_name, dlrt_param, encoder_input_num, encoder_output_num, is_debug, model_dir);
 
-        Ort::AllocatorWithDefaultOptions allocator;
-        const size_t num_inputs = session->GetInputCount();
-        m_input_name_ptrs.clear();
-        m_input_names.clear();
-        m_input_name_strs.clear();
-        m_input_name_ptrs.reserve(num_inputs);
-        m_input_names.reserve(num_inputs);
-        m_input_name_strs.reserve(num_inputs);
-        for (size_t i = 0; i < num_inputs; ++i) {
-            auto name_ptr = session->GetInputNameAllocated(i, allocator);
-            m_input_names.push_back(name_ptr.get());
-            m_input_name_ptrs.emplace_back(std::move(name_ptr));
-            m_input_name_strs.emplace_back(m_input_name_ptrs.back().get());
-        }
+        // Decoder Preprocess
+        num_prompt = utils::getInt(kv, "num_prompt", 1);
+        mask_channel = utils::getInt(kv, "mask_channel", 1);
+        mask_h = utils::getInt(kv, "mask_h", 256);
+        mask_w = utils::getInt(kv, "mask_w", 256);
+        has_mask_input = utils::getBool(kv, "has_mask_input", false);
+        decoder_input_num = utils::getInt(kv, "decoder_input_num", 7);
+        decoder_output_num = utils::getInt(kv, "decoder_output_num", 2);
 
-        const size_t num_outputs = session->GetOutputCount();
-        m_output_name_ptrs.clear();
-        m_output_names.clear();
-        m_output_name_strs.clear();
-        m_output_name_ptrs.reserve(num_outputs);
-        m_output_names.reserve(num_outputs);
-        m_output_name_strs.reserve(num_outputs);
-        for (size_t i = 0; i < num_outputs; ++i) {
-            auto name_ptr = session->GetOutputNameAllocated(i, allocator);
-            m_output_names.push_back(name_ptr.get());
-            m_output_name_ptrs.emplace_back(std::move(name_ptr));
-            m_output_name_strs.emplace_back(m_output_name_ptrs.back().get());
-        }
+        // Decoder inference
+        ort::OrtInit(decoder_model_name, ort_param, decoder_input_num, decoder_output_num, is_debug, decoder_is_dynamic, model_dir);
         
+        // Decoder inference: init after num_points is determined in decoder_preprocess
 
         // 创建仿射矩阵, 建立原始图片到模型输入图片的映射关系
-        Affine_Matrix();
-        return true;
+        utils::Affine_Matrix(src_w, src_h, dst_w, dst_h, src2dst, dst2src);
     }
 
-    void check() {
-        std::cout << "the engine's info:" << std::endl;
-        int nb_bindings = m_engine->GetNbBindings();
-        for (int i = 0; i < nb_bindings; ++i) {
-            auto shape = m_engine->GetBindingDimensions(i);
-            auto name = m_engine->GetBindingName(i);
-            auto data_type = m_engine->GetBindingDataType(i);
-            std::cout << name << "  " << data_type << std::endl;
-            for (int j = 0; j < shape.nbDims; ++j) {
-                std::cout << shape.d[j] << "  ";
-            }
-            std::cout << std::endl;
-        }
-        // dlnne 检验 Encoder静态shape模型
-        m_input_dims = m_context->GetBindingDimensions(0);
-        assert(m_param.batch_size == m_input_dims.d[0]);
-        assert(m_param.channel == m_input_dims.d[1]);
-        assert(m_param.dst_h == m_input_dims.d[2]);
-        assert(m_param.dst_w == m_input_dims.d[3]);
-
-        m_output_dims = m_context->GetBindingDimensions(1);
-        assert(m_param.high_res_feats_0_C == m_output_dims.d[1]);
-        assert(m_param.high_res_feats_0_H == m_output_dims.d[2]);
-        assert(m_param.high_res_feats_0_W == m_output_dims.d[3]);
-
-        m_output_dims = m_context->GetBindingDimensions(2);
-        assert(m_param.high_res_feats_1_C == m_output_dims.d[1]);
-        assert(m_param.high_res_feats_1_H == m_output_dims.d[2]);
-        assert(m_param.high_res_feats_1_W == m_output_dims.d[3]);
-
-        m_output_dims = m_context->GetBindingDimensions(3);
-        assert(m_param.image_embed_C == m_output_dims.d[1]);
-        assert(m_param.image_embed_H == m_output_dims.d[2]);
-        assert(m_param.image_embed_W == m_output_dims.d[3]);
-
-        // onnxruntime 检验 Decoder 模型
-        
-    }
-
-    void Alloc_buffer() {
+    void encoder_preprocess(const cv::Mat& img) {
         // Image To Device
-        m_input_src_device = nullptr;
-        CHECK(cudaMalloc(&m_input_src_device, m_param.channel * m_param.src_h * m_param.src_w * sizeof(unsigned char)));
-
-        // Pre-process result to Device
-        m_input_dst_device = nullptr;
-        // [1,3,1024,1024]
-        CHECK(cudaMalloc(&m_input_dst_device, m_param.channel * m_param.dst_h * m_param.dst_w * sizeof(float)));
-
-        // Image Encoder模型输出到Device
-        m_output0_device = nullptr;
-        m_output1_device = nullptr;
-        m_output2_device = nullptr;
-
-        // [1,32,256,256]
-        CHECK(cudaMalloc(&m_output0_device,
-                         m_param.high_res_feats_0_C * m_param.high_res_feats_0_H * m_param.high_res_feats_0_W * sizeof(float)));
-        // [1,64,128,128]
-        CHECK(cudaMalloc(&m_output1_device,
-                         m_param.high_res_feats_1_C * m_param.high_res_feats_1_H * m_param.high_res_feats_1_W * sizeof(float)));
-        // [1,256,64,64]
-        CHECK(cudaMalloc(&m_output2_device, m_param.image_embed_C * m_param.image_embed_H * m_param.image_embed_W * sizeof(float)));
-
-        // Image Encoder模型输出到 Host
-        m_output0_host =
-            (float*)malloc(m_param.high_res_feats_0_C * m_param.high_res_feats_0_H * m_param.high_res_feats_0_W * sizeof(float));
-        m_output1_host =
-            (float*)malloc(m_param.high_res_feats_1_C * m_param.high_res_feats_1_H * m_param.high_res_feats_1_W * sizeof(float));
-        m_output2_host = (float*)malloc(m_param.image_embed_C * m_param.image_embed_H * m_param.image_embed_W * sizeof(float));
-
-        m_detections.reserve(m_param.topK);
-        m_points.reserve(m_param.topK);
-        m_result_masks.reserve(m_param.topK);
-    }
-
-    void Free_buffer() {
-        CHECK(cudaFree(m_input_src_device))
-        CHECK(cudaFree(m_input_dst_device))
-        CHECK(cudaFree(m_output0_device))
-        CHECK(cudaFree(m_output1_device))
-        CHECK(cudaFree(m_output2_device))
-        free(m_output0_host);
-        free(m_output1_host);
-        free(m_output2_host);
-    }
-
-    // 计算仿射变换的逆变换
-    void invertAffineTransform(const float src2dst[2][3], float dst2src[2][3]) {
-        // 提取 2x2 旋转/缩放矩阵
-        float a = src2dst[0][0];
-        float b = src2dst[0][1];
-        float c = src2dst[1][0];
-        float d = src2dst[1][1];
-
-        // 提取平移向量
-        float tx = src2dst[0][2];
-        float ty = src2dst[1][2];
-
-        // 计算行列式
-        float det = a * d - b * c;
-
-        // 计算逆变换矩阵
-        dst2src[0][0] = d / det;
-        dst2src[0][1] = -b / det;
-        dst2src[0][2] = -(d * tx - b * ty) / det;
-        dst2src[1][0] = -c / det;
-        dst2src[1][1] = a / det;
-        dst2src[1][2] = -(-c * tx + a * ty) / det;
-    }
-
-    void Affine_Matrix() {
-        // 读入图像后，计算仿射矩阵
-        float a = float(dst_h) / m_param.src_h;
-        float b = float(m_param.dst_w) / m_param.src_w;
-        float scale = a < b ? a : b;
-
-        // cv::Mat src2dst = (cv::Mat_<float>(2, 3) << scale, 0.f, (-scale * m_param.src_w + m_param.dst_w + scale - 1) * 0.5, 0.f, scale,
-        //                    (-scale * m_param.src_h + m_param.dst_h + scale - 1) * 0.5);
-        // cv::Mat dst2src = cv::Mat::zeros(2, 3, CV_32FC1);
-        // cv::invertAffineTransform(src2dst, dst2src);
-
-        // 创建 src2dst 变换矩阵
-        float src2dst[2][3] = {{scale, 0.f, (-scale * m_param.src_w + m_param.dst_w + scale - 1) * 0.5f},
-                               {0.f, scale, (-scale * m_param.src_h + m_param.dst_h + scale - 1) * 0.5f}};
-
-        src2dst.v0 = src2dst[0][0];
-        src2dst.v1 = src2dst[0][1];
-        src2dst.v2 = src2dst[0][2];
-        src2dst.v3 = src2dst[1][0];
-        src2dst.v4 = src2dst[1][1];
-        src2dst.v5 = src2dst[1][2];
-
-        std::cout << "v0: " << src2dst.v0 << " v1: " << src2dst.v1 << " v2: " << src2dst.v2 << std::endl;
-        std::cout << "v3: " << src2dst.v3 << " v4: " << src2dst.v4 << " v5: " << src2dst.v5 << std::endl;
-
-        // 计算逆变换
-        float dst2src[2][3];
-        invertAffineTransform(src2dst, dst2src);
-
-        // 赋值给成员变量
-        dst2src.v0 = dst2src[0][0];
-        dst2src.v1 = dst2src[0][1];
-        dst2src.v2 = dst2src[0][2];
-        dst2src.v3 = dst2src[1][0];
-        dst2src.v4 = dst2src[1][1];
-        dst2src.v5 = dst2src[1][2];
-
-        std::cout << "v0: " << dst2src.v0 << " v1: " << dst2src.v1 << " v2: " << dst2src.v2 << std::endl;
-        std::cout << "v3: " << dst2src.v3 << " v4: " << dst2src.v4 << " v5: " << dst2src.v5 << std::endl;
-    }
-
-    std::array<int, 4> clamp_box(const ztu::nn::image_rect_t& box, int max_w, int max_h) {
-        int left = std::clamp(box.left, 0, max_w - 1);
-        int right = std::clamp(box.right, 0, max_w - 1);
-        int top = std::clamp(box.top, 0, max_h - 1);
-        int bottom = std::clamp(box.bottom, 0, max_h - 1);
-        if (right < left) {
-            std::swap(left, right);
-        }
-        if (bottom < top) {
-            std::swap(top, bottom);
-        }
-        return {left, top, right, bottom};
-    }
-
-    void preprocess() {
-        CHECK(cudaMemcpy(m_input_src_device, img.data, m_param.channel * m_param.src_h * m_param.src_w * sizeof(unsigned char),
-                         cudaMemcpyHostToDevice));
+        input_src_device = nullptr;
+        CHECK(cudaMalloc(&input_src_device, src_channel * src_h * src_w * sizeof(unsigned char)));
+        CHECK(cudaMemcpy(input_src_device, img.data, src_channel * src_h * src_w * sizeof(unsigned char), cudaMemcpyHostToDevice));
+        // Pro-precess
+        // input_0
+        // input_src_device: [1,src_h,src_w,3] -> dlrt_param.input_buffers[0]: [1,3,dst_h,dst_w]
         // 图像预处理：仿射变换, 归一化, HWC->CHW, BGR2RGB
-        affine_bilinear(m_input_src_device, m_param.src_w, m_param.src_h, m_input_dst_device, m_param.dst_w, m_param.dst_h, m_dst2src);
+        affine_bilinear_pad0(input_src_device, src_w, src_h, dlrt_param.input_buffers[0].device_ptr, dst_w, dst_h, dst2src);
+        if (is_debug) std::cout << "Encoder Preprocess done." << std::endl;
+        CHECK(cudaFree(input_src_device));
+    }
 
+    bool encoder_infer() {
+        bool success = dlrt::infer(dlrt_param);
+        assert(success == true);
+        if (is_debug) std::cout << "Encoder Inference done." << std::endl;
+        return success;
+    }
+
+    void encoder_postprocess() {}
+    void decoder_preprocess(const std::vector<utils::Box>& boxes, const std::vector<utils::Point>& points = {}) {
+        point_coords.clear();
+        point_labels.clear();
         // 输入原始图片检测框 缩放变换
-        int num_labels = 1;
-        int num_points = static_cast<int>(m_detections.size() * 2) + static_cast<int>(m_points.size());
+        num_points = static_cast<int>(boxes.size() * 2) + static_cast<int>(points.size());
+        if (num_points <= 0) {
+            return;
+        }
+        std::array<int64_t, 3> point_coords_shape = {1, num_points, 2};
+        std::array<int64_t, 2> point_labels_shape = {1, num_points};
 
-        std::array<int64_t, 3> point_coords_shape = {num_labels, num_points, 2};
-        std::array<int64_t, 2> point_labels_shape = {num_labels, num_points};
+        for (auto& box : boxes) {
+            float x1 = src2dst.v0 * box.left + src2dst.v1 * box.top + src2dst.v2;
+            float y1 = src2dst.v3 * box.left + src2dst.v4 * box.top + src2dst.v5;
+            float x2 = src2dst.v0 * box.right + src2dst.v1 * box.bottom + src2dst.v2;
+            float y2 = src2dst.v3 * box.right + src2dst.v4 * box.bottom + src2dst.v5;
 
-        std::vector<std::array<float, 2>> point_coords;
-        std::vector<float> point_labels;
-        point_coords.reserve(num_points);
-        point_labels.reserve(num_points);
-
-        for (auto& det : m_detections) {
-            float x1 = m_src2dst.v0 * det.left + m_src2dst.v1 * det.top + m_src2dst.v2;
-            float y1 = m_src2dst.v3 * det.left + m_src2dst.v4 * det.top + m_src2dst.v5;
-            float x2 = m_src2dst.v0 * det.right + m_src2dst.v1 * det.bottom + m_src2dst.v2;
-            float y2 = m_src2dst.v3 * det.right + m_src2dst.v4 * det.bottom + m_src2dst.v5;
-
-            x1 = std::clamp(x1, 0, m_param.dst_w - 1);
-            x2 = std::clamp(x2, 0, m_param.dst_w - 1);
-            y1 = std::clamp(y1, 0, m_param.dst_h - 1);
-            y2 = std::clamp(y2, 0, m_param.dst_h - 1);
+            x1 = clampf(x1, 0.0f, static_cast<float>(dst_w - 1));
+            x2 = clampf(x2, 0.0f, static_cast<float>(dst_w - 1));
+            y1 = clampf(y1, 0.0f, static_cast<float>(dst_h - 1));
+            y2 = clampf(y2, 0.0f, static_cast<float>(dst_h - 1));
 
             // 左上角
             point_coords.push_back({x1, y1});
-            point_labels.push_back(2.0f);
+            point_labels.push_back(2.0f);  // box-left-top
 
             // 右下角
             point_coords.push_back({x2, y2});
-            point_labels.push_back(3.0f);
+            point_labels.push_back(3.0f);  // box-right-bottom
         }
 
-        for (auto& point : m_points) {
-            float x = m_src2dst.v0 * point.x + m_src2dst.v1 * point.y + m_src2dst.v2;
-            float y = m_src2dst.v3 * point.x + m_src2dst.v4 * point.y + m_src2dst.v5;
+        for (const auto& point : points) {
+            float x = src2dst.v0 * point.x + src2dst.v1 * point.y + src2dst.v2;
+            float y = src2dst.v3 * point.x + src2dst.v4 * point.y + src2dst.v5;
 
-            point.x = std::clamp(x, 0.0f, static_cast<float>(m_param.dst_w - 1));
-            point.y = std::clamp(y, 0.0f, static_cast<float>(m_param.dst_h - 1));
+            float x_clamped = clampf(x, 0.0f, static_cast<float>(dst_w - 1));
+            float y_clamped = clampf(y, 0.0f, static_cast<float>(dst_h - 1));
 
-            point_coords.push_back({point.x, point.y});
+            point_coords.push_back({x_clamped, y_clamped});
             point_labels.push_back(point.flag ? 1.0f : 0.0f);
         }
 
-        const int mask_size = m_param.image_embed_H * 4;
-        m_mask_input.assign(1 * mask_size * mask_size, 0.0f);
-        m_has_mask_input = {0.0f};
-        std::array<int64_t, 4> mask_input_shape = {1, 1, mask_size, mask_size};
-        std::array<int64_t, 1> has_mask_input_shape = {1};
 
-        mask_input_tensor = Ort::Value::CreateTensor<float>(memory_info, m_mask_input.data(), m_mask_input.size(),
-                                                            mask_input_shape.data(), mask_input_shape.size());
-        has_mask_input_tensor = Ort::Value::CreateTensor<float>(memory_info, m_has_mask_input.data(), m_has_mask_input.size(),
-                                                                has_mask_input_shape.data(), has_mask_input_shape.size());
+        mask_input_host = (float*)malloc(mask_channel * mask_h * mask_w * sizeof(float));
+        memset(mask_input_host, 0, mask_channel * mask_h * mask_w * sizeof(float));
+        // SAM2 decoder 通常在没有 mask 输入时使用 0，若无历史 mask 可强制为 0
+        has_mask_input_value = has_mask_input ? 1.0f : 0.0f;
 
-        m_point_coords.clear();
-        m_point_coords.reserve(point_coords.size() * 2);
-        for (const auto& p : point_coords) {
-            m_point_coords.push_back(p[0]);
-            m_point_coords.push_back(p[1]);
-        }
-        m_point_labels = std::move(point_labels);
+        assert(mask_h == embed_h * 4 && mask_w == embed_w * 4);
+        std::vector<std::vector<int64_t>> input_shapes = {
+            {1, embed_c, embed_h, embed_w},     // image_embeddings
+            {1, feat0_c, feat0_h, feat0_w},     // feat0
+            {1, feat1_c, feat1_h, feat1_w},     // feat1
+            {1, num_points, 2},                 // point_coords
+            {1, num_points},                    // point_labels
+            {1, mask_channel, mask_h, mask_w},  // mask_input
+            {1}                                 // has_mask_input
+        };
+        std::vector<bool> is_dynamic = {false, false, false, true, true, false, false};
+        std::vector<bool> is_from_gpu = {true, true, true, false, false, false, false};
+        std::vector<float*> input_ptrs = {
+            dlrt_param.output_buffers[2].device_ptr,  // image_embeddings
+            dlrt_param.output_buffers[0].device_ptr,  // feat0
+            dlrt_param.output_buffers[1].device_ptr,  // feat1
+            point_coords.data()->data(),              // point_coords
+            point_labels.data(),                      // point_labels
+            mask_input_host,                          // mask_input
+            &has_mask_input_value,                    // has_mask_input
+        };
 
-        point_coords_tensor = Ort::Value::CreateTensor<float>(memory_info, m_point_coords.data(), m_point_coords.size(),
-                                                              point_coords_shape.data(), point_coords_shape.size());
-        point_labels_tensor = Ort::Value::CreateTensor<float>(memory_info, m_point_labels.data(), m_point_labels.size(),
-                                                              point_labels_shape.data(), point_labels_shape.size());
+        ort::BufferInit(ort_param, input_shapes, is_dynamic, is_from_gpu, input_ptrs);
     }
-    bool infer() {
-        float* bindings[] = {m_input_dst_device, m_output0_device, m_output1_device, m_output2_device};
-        bool context = m_context->Execute(1, (void**)bindings);
 
-        if (!context) {
-            std::cerr << "Inference execution failed." << std::endl;
+    bool decoder_infer() {
+        ort::infer(ort_param);
+        if (ort_param.output_buffers.empty()) {
             return false;
         }
 
-        CHECK(cudaMemcpy(m_output0_host, m_output0_device,
-                         m_param.high_res_feats_0_C * m_param.high_res_feats_0_H * m_param.high_res_feats_0_W * sizeof(float),
-                         cudaMemcpyDeviceToHost));
-        CHECK(cudaMemcpy(m_output1_host, m_output1_device,
-                         m_param.high_res_feats_1_C * m_param.high_res_feats_1_H * m_param.high_res_feats_1_W * sizeof(float),
-                         cudaMemcpyDeviceToHost));
-        CHECK(cudaMemcpy(m_output2_host, m_output2_device,
-                         m_param.image_embed_C * m_param.image_embed_H * m_param.image_embed_W * sizeof(float), cudaMemcpyDeviceToHost));
+        // output_0: low_res_masks
+        const auto& mask_buf = ort_param.output_buffers[0];
+        decoder_mask_shape = mask_buf.shape;
+        size_t mask_numel = 1;
+        for (auto d : decoder_mask_shape) {
+            mask_numel *= static_cast<size_t>(d);
+        }
+        decoder_mask_data.resize(mask_numel);
+        if (mask_buf.device_ptr) {
+            std::memcpy(decoder_mask_data.data(), mask_buf.device_ptr, mask_numel * sizeof(float));
+        }
 
-        std::array<int64_t, 4> image_embed_shape = {1, m_param.image_embed_C, m_param.image_embed_H, m_param.image_embed_W};
-        std::array<int64_t, 4> high_res0_shape = {1, m_param.high_res_feats_0_C, m_param.high_res_feats_0_H, m_param.high_res_feats_0_W};
-        std::array<int64_t, 4> high_res1_shape = {1, m_param.high_res_feats_1_C, m_param.high_res_feats_1_H, m_param.high_res_feats_1_W};
-
-        image_embed_tensor = Ort::Value::CreateTensor<float>(memory_info, m_output2_host,
-                                                             m_param.image_embed_C * m_param.image_embed_H * m_param.image_embed_W,
-                                                             image_embed_shape.data(), image_embed_shape.size());
-        high_res0_tensor = Ort::Value::CreateTensor<float>(memory_info, m_output0_host,
-                                                           m_param.high_res_feats_0_C * m_param.high_res_feats_0_H * m_param.high_res_feats_0_W,
-                                                           high_res0_shape.data(), high_res0_shape.size());
-        high_res1_tensor = Ort::Value::CreateTensor<float>(memory_info, m_output1_host,
-                                                           m_param.high_res_feats_1_C * m_param.high_res_feats_1_H * m_param.high_res_feats_1_W,
-                                                           high_res1_shape.data(), high_res1_shape.size());
-
-        std::vector<Ort::Value> ort_inputs;
-        ort_inputs.reserve(m_input_name_strs.size());
-        for (const auto& name : m_input_name_strs) {
-            if (name == "image_embed") {
-                ort_inputs.emplace_back(std::move(image_embed_tensor));
-            } else if (name == "high_res_feats_0") {
-                ort_inputs.emplace_back(std::move(high_res0_tensor));
-            } else if (name == "high_res_feats_1") {
-                ort_inputs.emplace_back(std::move(high_res1_tensor));
-            } else if (name == "point_coords") {
-                ort_inputs.emplace_back(std::move(point_coords_tensor));
-            } else if (name == "point_labels") {
-                ort_inputs.emplace_back(std::move(point_labels_tensor));
-            } else if (name == "mask_input") {
-                ort_inputs.emplace_back(std::move(mask_input_tensor));
-            } else if (name == "has_mask_input") {
-                ort_inputs.emplace_back(std::move(has_mask_input_tensor));
-            } else {
-                std::cerr << "Unsupported decoder input name: " << name << std::endl;
-                return false;
+        // output_1: iou_predictions (optional)
+        if (ort_param.output_buffers.size() > 1) {
+            const auto& iou_buf = ort_param.output_buffers[1];
+            decoder_iou_shape = iou_buf.shape;
+            size_t iou_numel = 1;
+            for (auto d : decoder_iou_shape) {
+                iou_numel *= static_cast<size_t>(d);
+            }
+            decoder_iou_data.resize(iou_numel);
+            if (iou_buf.device_ptr) {
+                std::memcpy(decoder_iou_data.data(), iou_buf.device_ptr, iou_numel * sizeof(float));
             }
         }
-
-        auto outputs = session->Run(Ort::RunOptions{nullptr}, m_input_names.data(), ort_inputs.data(), ort_inputs.size(),
-                                    m_output_names.data(), m_output_names.size());
-
-        if (outputs.empty()) {
-            std::cerr << "decoder outputs size mismatch" << std::endl;
-            return false;
-        }
-
-        m_decoder_mask_shape.clear();
-        m_decoder_mask_data.clear();
-        {
-            auto info = outputs[0].GetTensorTypeAndShapeInfo();
-            m_decoder_mask_shape = info.GetShape();
-            size_t numel = 1;
-            for (auto d : m_decoder_mask_shape) {
-                if (d > 0) numel *= static_cast<size_t>(d);
-            }
-            const float* data = outputs[0].GetTensorData<float>();
-            m_decoder_mask_data.assign(data, data + numel);
-        }
-
-        if (outputs.size() >= 2) {
-            auto info = outputs[1].GetTensorTypeAndShapeInfo();
-            auto shape = info.GetShape();
-            size_t numel = 1;
-            for (auto d : shape) {
-                if (d > 0) numel *= static_cast<size_t>(d);
-            }
-            const float* data = outputs[1].GetTensorData<float>();
-            m_decoder_iou_data.assign(data, data + numel);
-        }
-
         return true;
     }
 
-    void postprocess(cv::Mat& img) {
-        if (m_decoder_mask_data.empty() || m_decoder_mask_shape.size() < 2) {
+    void decoder_postprocess(cv::Mat& img) {
+        if (decoder_mask_data.empty() || decoder_mask_shape.size() < 2) {
             return;
         }
 
         int mask_h = 0;
         int mask_w = 0;
-        if (m_decoder_mask_shape.size() == 4) {
-            mask_h = static_cast<int>(m_decoder_mask_shape[2]);
-            mask_w = static_cast<int>(m_decoder_mask_shape[3]);
-        } else if (m_decoder_mask_shape.size() == 3) {
-            mask_h = static_cast<int>(m_decoder_mask_shape[1]);
-            mask_w = static_cast<int>(m_decoder_mask_shape[2]);
+        int num_masks = 1;
+        int batch = 1;
+        if (decoder_mask_shape.size() == 4) {
+            batch = static_cast<int>(decoder_mask_shape[0]);
+            num_masks = static_cast<int>(decoder_mask_shape[1]);
+            mask_h = static_cast<int>(decoder_mask_shape[2]);
+            mask_w = static_cast<int>(decoder_mask_shape[3]);
+        } else if (decoder_mask_shape.size() == 3) {
+            num_masks = static_cast<int>(decoder_mask_shape[0]);
+            mask_h = static_cast<int>(decoder_mask_shape[1]);
+            mask_w = static_cast<int>(decoder_mask_shape[2]);
         } else {
             return;
         }
 
-        cv::Mat mask_f(mask_h, mask_w, CV_32F, m_decoder_mask_data.data());
+        int best_idx = 0;
+        if (!decoder_iou_data.empty() && num_masks > 1) {
+            float best = decoder_iou_data[0];
+            for (int i = 1; i < num_masks; ++i) {
+                if (decoder_iou_data[i] > best) {
+                    best = decoder_iou_data[i];
+                    best_idx = i;
+                }
+            }
+        }
+
+        size_t mask_area = static_cast<size_t>(mask_h) * static_cast<size_t>(mask_w);
+        size_t offset = static_cast<size_t>(best_idx) * mask_area;
+        if (decoder_mask_shape.size() == 4) {
+            offset = static_cast<size_t>(0) * static_cast<size_t>(num_masks) * mask_area + offset;
+        }
+        if (offset + mask_area > decoder_mask_data.size()) {
+            return;
+        }
+
+        cv::Mat mask_f(mask_h, mask_w, CV_32F, decoder_mask_data.data() + offset);
         cv::Mat mask = mask_f.clone();
 
         cv::Mat mask_resized;
-        cv::resize(mask, mask_resized, cv::Size(m_param.dst_w, m_param.dst_h), 0, 0, cv::INTER_LINEAR);
+        cv::resize(mask, mask_resized, cv::Size(dst_w, dst_h), 0, 0, cv::INTER_LINEAR);
 
-        cv::Mat affine = (cv::Mat_<float>(2, 3) << m_dst2src.v0, m_dst2src.v1, m_dst2src.v2, m_dst2src.v3, m_dst2src.v4, m_dst2src.v5);
+        float scale = std::min(static_cast<float>(dst_h) / src_h, static_cast<float>(dst_w) / src_w);
+        int new_h = static_cast<int>(src_h * scale);
+        int new_w = static_cast<int>(src_w * scale);
+        int start_h = (dst_h - new_h) / 2;
+        int start_w = (dst_w - new_w) / 2;
+        start_h = std::max(0, start_h);
+        start_w = std::max(0, start_w);
+        new_h = std::min(new_h, dst_h - start_h);
+        new_w = std::min(new_w, dst_w - start_w);
+        cv::Mat mask_no_pad = mask_resized(cv::Rect(start_w, start_h, new_w, new_h));
+
         cv::Mat mask_src;
-        cv::warpAffine(mask_resized, mask_src, affine, cv::Size(m_param.src_w, m_param.src_h), cv::INTER_LINEAR, cv::BORDER_CONSTANT, 0);
+        cv::resize(mask_no_pad, mask_src, cv::Size(src_w, src_h), 0, 0, cv::INTER_LINEAR);
 
         if (!img.empty()) {
+            if (is_debug) {
+                double min_val = 0.0, max_val = 0.0;
+                cv::minMaxLoc(mask_src, &min_val, &max_val);
+                cv::Scalar mean_val = cv::mean(mask_src);
+                std::cout << "mask_src stats: min=" << min_val << " max=" << max_val << " mean=" << mean_val[0] << std::endl;
+                if (!decoder_iou_data.empty()) {
+                    std::cout << "iou_predictions:";
+                    for (size_t i = 0; i < decoder_iou_data.size(); ++i) {
+                        std::cout << " " << decoder_iou_data[i];
+                    }
+                    std::cout << std::endl;
+                }
+            }
             cv::Mat mask_u8;
             cv::threshold(mask_src, mask_u8, 0.0, 255.0, cv::THRESH_BINARY);
             mask_u8.convertTo(mask_u8, CV_8U);
             cv::Mat colored;
             cv::cvtColor(mask_u8, colored, cv::COLOR_GRAY2BGR);
-            img = img * 0.6 + colored * 0.4;
+            colored.setTo(cv::Scalar(0, 255, 0), mask_u8);
+
+            utils::mask_canvas mask_canvas;
+            mask_canvas.mask_instance_bgr = colored;
+            mask_canvas.canvas = cv::Mat::zeros(img.size(), img.type());
+            mask_canvas.roisrc = cv::Rect(0, 0, img.cols, img.rows);
+            mask_canvas.weight = 0.4f;
+
+            std::vector<utils::mask_canvas> masks;
+            masks.emplace_back(std::move(mask_canvas));
+            cv_utils::draw(img, {}, masks, {}, false, true, false, is_show, is_save, "SAM2", save_path);
         }
     }
-
-    void reset() {
-        // 重置检测框结果
-        m_detections.clear();
-        m_points.clear();
-        m_result_masks.clear();
-    }
-
-    /*
-        1. 输入待分割的图片, 点坐标, 检测框
-        2. 预处理, 推理, 后处理
-    */
-    void task() {
-
-        preprocess();
-        infer();
-        postprocess(img);
-
-    }
-
+    
    public:
-    utils::AffineMat m_dst2src;
-    utils::AffineMat m_src2dst;
+    std::string encoder_model_name = "image_encoder_s";
+    std::string decoder_model_name = "image_decoder_s";
+    std::string save_path = "/home/linaro/program/yolov11_seg_deepsort/sma2_result.jpg";
+    bool is_debug = true;
+    bool is_save = false;
+    bool is_show = false;
+    bool encoder_is_dynamic = false;
+    bool decoder_is_dynamic = true;
+    int delaytime = 15;
+    // Encoder Proprecess:
+    int src_h = 0;
+    int src_w = 0;
+    int src_channel = 0;
+    int batch_size = 1;
+    int dst_channel = 3;
+    int dst_h = 0;
+    int dst_w = 0;
+    int encoder_input_num = 1;
+    // Postprocess:
+    int feat0_c = 0;
+    int feat0_h = 0;
+    int feat0_w = 0;
+    int feat1_c = 0;
+    int feat1_h = 0;
+    int feat1_w = 0;
+    int embed_c = 0;
+    int embed_h = 0;
+    int embed_w = 0;
+    int encoder_output_num = 2;
 
-    // input
-    unsigned char* m_input_src_device;
-    float* m_input_dst_device;
-    std::vector<utils::Box> m_detections;
-    std::vector<utils::Point> m_points;
-    std::vector<cv::Mat> m_result_masks;
+    dlrt::dlrtParam dlrt_param;
+    utils::AffineMat src2dst;
+    utils::AffineMat dst2src;
 
-    Ort::Value image_embed_tensor;
-    Ort::Value high_res0_tensor;
-    Ort::Value high_res1_tensor;
-    Ort::Value point_coords_tensor;
-    Ort::Value point_labels_tensor;
-    Ort::Value mask_input_tensor;
-    Ort::Value has_mask_input_tensor;
+    // encoder input
+    unsigned char* input_src_device;
 
-    std::vector<float> m_mask_input;
-    std::array<float, 1> m_has_mask_input;
-    std::vector<float> m_point_coords;
-    std::vector<float> m_point_labels;
+    // encoder output
+    float* encoder_output0_host;
+    float* encoder_output1_host;
+    float* encoder_output2_host;
 
-    std::vector<Ort::AllocatedStringPtr> m_input_name_ptrs;
-    std::vector<Ort::AllocatedStringPtr> m_output_name_ptrs;
-    std::vector<const char*> m_input_names;
-    std::vector<const char*> m_output_names;
-    std::vector<std::string> m_input_name_strs;
-    std::vector<std::string> m_output_name_strs;
+    // decoder input
+    bool has_mask_input;
+    float has_mask_input_value = 0.0f;
+    float* mask_input_host;
+    std::vector<std::array<float, 2>> point_coords;
+    std::vector<float> point_labels;
+    int num_prompt = 1;
+    int num_points = 0;
+    int mask_channel;
+    int mask_h;
+    int mask_w;
+    std::vector<float> mask_input;
 
-    // output
-    float* m_output0_device;
-    float* m_output1_device;
-    float* m_output2_device;
+    int decoder_input_num = 0;
+    int decoder_output_num = 0;
+    ort::OrtParam ort_param;
 
-    float* m_output0_host;
-    float* m_output1_host;
-    float* m_output2_host;
-
-    std::vector<int64_t> m_decoder_mask_shape;
-    std::vector<float> m_decoder_mask_data;
-    std::vector<float> m_decoder_iou_data;
-
-    SAM2Parameter m_param;
+    // decoder output
+    std::vector<float> decoder_mask_data;
+    std::vector<int64_t> decoder_mask_shape;
+    std::vector<float> decoder_iou_data;
+    std::vector<int64_t> decoder_iou_shape;
 };

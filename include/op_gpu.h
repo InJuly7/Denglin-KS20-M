@@ -12,6 +12,12 @@ void cuda_check(cudaError_t state, std::string file, int line);
 void affine_bilinear(unsigned char* src, const int src_w, const int src_h, float* dst, const int dst_w, const int dst_h,
                      const utils::AffineMat matrix);
 
+void affine_bilinear_pad0(unsigned char* src, const int src_w, const int src_h, float* dst, const int dst_w, const int dst_h,
+                          const utils::AffineMat matrix);
+
 void conf_filter(float* src, int src_box_width, int src_box_num, float* dst, int dst_box_width, int topK, int num_class, float conf_thresh);
+
+void conf_filter_nomask(float* src, int src_box_width, int src_box_num, float* dst, int dst_box_width, int topK, int num_class,
+                        float conf_thresh);
 
 void nms_fast(float* src, int src_box_width, int topK, float iou_thresh);

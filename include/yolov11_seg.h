@@ -23,6 +23,7 @@ class YOLOV11_SEG {
     void init(const std::string inifile, const int _src_h, const int _src_w, const int _src_channel) {
         auto kv = utils::loadIni(inifile);
         model_name = utils::getStr(kv, "model_name", "yolov11s_seg");
+        std::string model_dir = utils::getStr(kv, "model_dir", "");
         save_path = utils::getStr(kv, "save_path", "/home/linaro/program/yolov11_seg_deepsort/result.jpg");
         is_debug = utils::getBool(kv, "is_debug", true);
         is_save = utils::getBool(kv, "is_save", false);
@@ -53,7 +54,7 @@ class YOLOV11_SEG {
         iou_thresh = utils::getFloat(kv, "iou_thresh", 0.50f);
         topK = utils::getInt(kv, "topK", 300);
         // inference
-        dlrt::dlrtInit(model_name, dlrt_param, input_num, output_num, is_debug);
+        dlrt::dlrtInit(model_name, dlrt_param, input_num, output_num, is_debug, model_dir);
 
         // 创建仿射矩阵
         utils::Affine_Matrix(src_w, src_h, dst_w, dst_h, src2dst, dst2src);
@@ -69,9 +70,7 @@ class YOLOV11_SEG {
         // input_src_device: [1,src_h,src_w,3] -> dlrt_param.input_buffers[0]: [1,3,dst_h,dst_w]
         affine_bilinear(input_src_device, src_w, src_h, dlrt_param.input_buffers[0].device_ptr, dst_w, dst_h, dst2src);
         if (is_debug) std::cout << "Preprocess done." << std::endl;
-        // Image To Device
         CHECK(cudaFree(input_src_device));
-        // DumpGPUMemoryToFile(m_input_dst_device, 3 * m_param.src_h * m_param.src_w * sizeof(float), "m_input_dst_device.bin");
     }
 
     bool infer() {
@@ -79,7 +78,6 @@ class YOLOV11_SEG {
         assert(success == true);
         if (is_debug) std::cout << "Inference done." << std::endl;
         return success;
-        // DumpGPUMemoryToFile(m_output_src_device, m_output_area * sizeof(float), "inference_output.bin");
     }
 
     void postprocess(cv::Mat& img) {
@@ -133,9 +131,11 @@ class YOLOV11_SEG {
 
                 int label = ptr[5];
                 float conf = ptr[4];
+                if(is_debug) std::cout << "	label: " << label << " conf " << conf << std::endl;
+                if (label < 0 || label >= num_class) continue;
                 cv::Scalar color = colors[label];
                 std::string class_name = class_names[label];
-                if(is_debug) std::cout << "	label: " << label << " conf " << conf << std::endl;
+                
 
                 // [32,1] 分割编码系数
                 Eigen::Map<Eigen::MatrixXf> img_obj_seg_(ptr + 7, mask_channel, 1);
@@ -214,7 +214,7 @@ class YOLOV11_SEG {
         }
         
         if (is_show) cv_utils::draw(img, boxes, masks, labels, true, true, true, is_show);
-        if (is_save) cv_utils::draw(img, boxes, masks, labels, false, true, false, is_show, is_save, windows_title, save_path);  
+        if (is_save) cv_utils::draw(img, boxes, masks, labels, true, true, true, is_show, is_save, windows_title, save_path);  
 
         // Post process result to Device
         CHECK(cudaFree(output1_conf_device));

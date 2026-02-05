@@ -141,8 +141,20 @@ inline void EngineContextInit(EngineContext& engine_context, const std::string& 
     engine_context.slz_length = slz_length;
 }
 
-inline void dlrtInit(const std::string& model_name, dlrtParam& param, int input_num, int output_num, bool is_debug = false) {
-    const char* kModelDir = "/data/model/yolov11s_seg/";
+inline std::string NormalizeModelDir(const std::string& model_dir) {
+    std::string dir = model_dir.empty() ? "/data/model/yolov11s_seg/" : model_dir;
+    if (!dir.empty() && dir.front() != '/') {
+        dir = std::string("/data/model/") + dir;
+    }
+    if (!dir.empty() && dir.back() != '/') {
+        dir.push_back('/');
+    }
+    return dir;
+}
+
+inline void dlrtInit(const std::string& model_name, dlrtParam& param, int input_num, int output_num,
+                     bool is_debug = false, const std::string& model_dir = "") {
+    const std::string kModelDir = NormalizeModelDir(model_dir);
     param.model_name = model_name;
     param.onnx_path = kModelDir + model_name + ".onnx";
     param.rlym_path = kModelDir + model_name + ".rlym";
